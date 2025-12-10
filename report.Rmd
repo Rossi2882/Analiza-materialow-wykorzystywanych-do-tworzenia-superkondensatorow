@@ -1,0 +1,370 @@
+---
+title: "Analiza danych w R"
+author: "Adam Korbik"
+date: "2025-12-03"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 3 
+    toc_float: true
+---
+## Podsumowanie
+Niniejszy raport przedstawia szczegółową analizę danych eksperymentalnych dotyczących właściwości elektrod grafenowych, mających na celu identyfikację kluczowych czynników wpływających na pojemność właściwą (Capacitance (F/g)).
+
+W wyniku procesu czyszczenia i imputacji danych, zbiór wyjściowy liczący 21 kolumn i 925 został zredukowany do 921 wierszy i 12 kolumn. Największa część brakujących danych (ponad 60%) dotyczyła zmiennych atomowych i linków do publikacji, które zostały usunięte w całości. Pozostałe braki w zmiennych numerycznych zostały skutecznie uzupełnione medianą, a w kategorycznych – wartością "Unknown".
+
+Model uczenia maszynowego (XGBoost) wykazał, że najbardziej istotnym predyktorem pojemności jest Potential Window (V) oraz Current Density (A/g), wskazał też na duże znaczenie Electrode Configuration.).
+
+Macierz korelacji wskazuje na brak silnej zalezności pomiędzy danymi.
+
+```{r setup, include=FALSE, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(tibble)
+library(ggplot2)
+library(plotly)
+library(GGally)
+library(ggcorrplot)
+library(knitr)
+library(kableExtra)
+library(caret)
+library(xgboost)
+library(here)
+library(scales)
+```
+
+## Wykorzystane biblioteki
+
+```{r list-packages, echo=TRUE}
+loaded_packages <- .packages()
+packages_list <- sort(loaded_packages[loaded_packages != "knitr"])
+
+packages_df <- data.frame(
+  Biblioteka = packages_list
+)
+
+kable(
+  packages_df, 
+  format = "html"
+) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"), 
+    full_width = FALSE,
+    font_size = 12
+  ) %>%
+  column_spec(1, width = "15em")
+```
+## Wczytywanie danych
+```{r load-data, echo=TRUE, include=TRUE}
+df <- readr::read_csv(here::here("data", "data.csv"))
+```
+## Powtarzalność wyników
+```{r reproducibility, echo=TRUE, include=TRUE}
+set.seed(12345)
+
+options(digits = 4)
+
+session_info <- sessionInfo()
+```
+## Przetwarzanie brakujących danych
+```{r missing-table}
+missing_df <- data.frame(
+Kolumna = names(df),
+Braki = colSums(is.na(df)),
+Procent = round(colSums(is.na(df)) / nrow(df) * 100, 2)
+)
+
+row.names(missing_df) <- missing_df$Kolumna
+missing_df_fixed <- missing_df %>%
+    select(-Kolumna) %>%
+    arrange(desc(Procent))
+
+kable(missing_df_fixed) %>%
+kable_styling(full_width = FALSE)
+```
+### Usuwanie kolumn
+```{r remove-columns, echo=TRUE}
+to_remove <- missing_df %>%
+  filter(Procent > 60) %>%
+  pull(Kolumna)
+
+df_clean <- df %>%
+  select(where(~ mean(is.na(.)) <= 0.60))
+```
+### Usuwanie wierszy
+```{r remove-rows-with-many-na, echo=TRUE, }
+missing_per_row <- rowSums(is.na(df_clean))
+rows_with_more_than_4 <- sum(missing_per_row > 4)
+
+missing_per_row <- rowSums(is.na(df_clean))
+
+df_clean2 <- df_clean[missing_per_row <= 4, ]
+
+removed_rows <- sum(missing_per_row > 4)
+
+missing_after <- data.frame(
+  Kolumna = names(df_clean2),
+  Braki = colSums(is.na(df_clean2)),
+  Procent = round(colSums(is.na(df_clean2)) / nrow(df_clean2) * 100, 2)
+)
+
+missing_after <- missing_after[order(missing_after$Braki), ]
+
+```
+### Zastępywanie wartości numerycznych medianą
+```{r impute-median, echo=TRUE}
+df_final <- df_clean2 %>%
+  mutate(across(where(is.numeric), ~ ifelse(is.na(.), median(., na.rm = TRUE), .)))
+
+remaining_na <- colSums(is.na(df_final))
+```
+### Zastępowanie wartości kategorialnych przez "unknown"
+```{r impute-categorical, echo=TRUE}
+df_final <- df_final %>%
+ mutate(across(where(is.character) | where(is.factor), ~ replace_na(., "Unknown")))
+
+remaining_na_total <- colSums(is.na(df_final))
+print(remaining_na_total)
+```
+## Rozmiar zbioru i podstawowe statystyki
+```{r size-summary}
+rows_before <- nrow(df)
+cols_before <- ncol(df)
+
+rows_after <- nrow(df_final)
+cols_after <- ncol(df_final)
+
+size_summary <- data.frame(
+  Zbior = c("Przed przetwarzaniem", "Po przetwarzaniu"),
+  Wiersze = c(rows_before, rows_after),
+  Kolumny = c(cols_before, cols_after)
+)
+
+kable(size_summary) %>%
+  kable_styling(full_width = FALSE)
+```
+
+### Statystyki przed uzupełnianiem braków
+
+```{r stats-before}
+stats_before <- df %>%
+  select(where(is.numeric)) %>%
+  summary()
+
+stats_before
+```
+
+### Statystyki po uzupełnianiu braków i usuwaniu nieinformatywnych kolumn i wierszy
+
+```{r stats-after}
+stats_after <- df_final %>%
+  select(where(is.numeric)) %>%
+  summary()
+
+stats_after
+```
+
+## Prezentacja rozkładów wartości
+### Kolumny numeryczne
+```{r numeric-distributions-final, fig.height=6, fig.width=9, warning=FALSE, message=FALSE}
+numeric_vars <- df_final %>% select(where(is.numeric))
+
+plot_numeric_distribution <- function(data, var_name) {
+ggplot(data, aes(x = .data[[var_name]])) +
+geom_histogram(bins = 30, fill = "skyblue", color = "white", alpha = 0.7) + 
+labs(
+title = paste("Rozkład wartości:", var_name),
+x = var_name,
+y = "Liczba obserwacji"
+) +
+scale_x_continuous(breaks = scales::pretty_breaks(n = 10)) + 
+scale_y_continuous(breaks = scales::breaks_pretty(n = 10, integer = TRUE)) +
+theme_minimal()
+}
+
+for (col in names(numeric_vars)) {
+print(plot_numeric_distribution(df_final, col))
+}
+
+```
+
+### Kolumny kategorialne
+
+```{r categorical-distributions-fixed, fig.height=8, fig.width=10}
+plot_electrode_data <- df_final %>%
+  group_by(`Electrode Configuration`) %>%
+  summarise(Liczba = n()) %>%
+  arrange(desc(Liczba)) %>%
+  head(10) %>%
+  ungroup()
+
+plot_electrode <- plot_electrode_data %>%
+  ggplot(aes(x = reorder(`Electrode Configuration`, Liczba), y = Liczba)) +
+    geom_bar(stat = "identity", fill = "#0072B2") + 
+    geom_text(aes(label = Liczba), hjust = -0.1, size = 3.5) + 
+    coord_flip() +
+    labs(
+      title = "Top 10 najczęściej badanych Konfiguracji Elektrod",
+      x = NULL, 
+      y = "Liczba Obserwacji"
+    ) +
+    theme_minimal() +
+    theme(
+        axis.text.y = element_text(size = 10, colour = "black"), 
+        plot.title = element_text(hjust = 0.5)
+    )
+
+print(plot_electrode)
+
+plot_cell <- df_final %>%
+  group_by(`Cell Configuration (three/two electrode system)`) %>%
+  summarise(Liczba = n()) %>%
+  ggplot(aes(x = reorder(`Cell Configuration (three/two electrode system)`, -Liczba), y = Liczba)) +
+    geom_bar(stat = "identity", fill = "#D55E00") + 
+    geom_text(aes(label = Liczba), vjust = -0.5) +
+    labs(
+      title = "Częstość występowania konfiguracji ogniwa",
+      x = "Konfiguracja Ogniwa",
+      y = "Liczba Obserwacji"
+    ) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 0, hjust = 0.5))
+
+print(plot_cell)
+```
+
+## Korelacja pomiędzy zmiennymi
+
+```{r correlations-fixed, fig.height=10, fig.width=10, warning=FALSE}
+corr_data <- df_final %>%
+select(where(is.numeric))
+
+correlation_matrix <- cor(corr_data)
+
+ggcorrplot(
+correlation_matrix,
+hc.order = TRUE,
+lab = TRUE,
+lab_size = 2.5,
+method = "circle",
+colors = c("tomato2", "white", "steelblue"),
+title = "Macierz korelacji zmiennych numerycznych"
+) +
+theme(
+  axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+  axis.text.y = element_text(size = 8)
+)
+```
+
+## Interaktywny wykres  
+
+```{r interactive-plot, fig.height=8, fig.width=10}
+target_col <- "Capacitance (F/g)"
+category_col <- "Electrode Configuration"
+
+summary_data <- df_final %>%
+ group_by(.data[[category_col]]) %>%
+ summarise(
+  Mediana_Capacitance = median(.data[[target_col]], na.rm = TRUE),
+  Q1 = quantile(.data[[target_col]], 0.25, na.rm = TRUE),
+  Q3 = quantile(.data[[target_col]], 0.75, na.rm = TRUE),
+  Liczba_Prob = n()
+ ) %>%
+ arrange(desc(Mediana_Capacitance)) %>%
+ head(10) %>%
+  mutate(Wrapped_Category = stringr::str_wrap(.data[[category_col]], width = 30))
+
+p <- ggplot(summary_data, aes(
+  x = reorder(Wrapped_Category, Mediana_Capacitance), 
+  y = Mediana_Capacitance, 
+  fill = Mediana_Capacitance)) +
+ geom_bar(stat = "identity") +
+ geom_errorbar(aes(ymin = Q1, ymax = Q3), width = 0.2, color = "black") +
+ labs(
+ title = paste("Mediana Pojemności (F/g) dla Top 10 Konfiguracji Elektrod"),
+  subtitle = "Linie błędów reprezentują rozstęp międzykwartylowy (Q1-Q3)",
+  x = NULL,
+  y = target_col
+ ) +
+ coord_flip() +
+ scale_fill_continuous(low = "lightblue", high = "darkblue") +
+ theme_minimal() +
+ theme(legend.position = "none",
+        plot.margin = margin(t = 5, r = 10, b = 5, l = 10) 
+      )
+
+plotly::ggplotly(p) %>%
+ layout(
+  margin = list(l = 250, r = 20) 
+ )
+```
+
+## Wyjaśnialna sztuczna inteligencja
+
+```{r xai-prediction-final-importance-stable-v5, fig.height=8, fig.width=10, warning=FALSE}
+target_variable <- "Capacitance (F/g)" 
+target_col_final <- make.names(target_variable)
+
+data_model <- df_final %>%
+ select(
+ all_of(target_variable),
+ where(is.numeric),
+ `Electrode Configuration`,
+ `Cell Configuration (three/two electrode system)`
+ ) %>%
+ select(-matches("ID|Source|link|Ref\\.|DOI")) %>% 
+ rename_with(make.names) %>% 
+ mutate(across(where(is.character) | where(is.factor), as.factor)) 
+
+dmy <- dummyVars("~ .", data = data_model, fullRank = FALSE)
+data_prepared <- data.frame(predict(dmy, newdata = data_model))
+
+set.seed(12345)
+trainIndex <- createDataPartition(data_prepared[[target_col_final]], p = 0.7, list = FALSE)
+train_data <- data_prepared[trainIndex, ]
+
+X_train <- as.matrix(train_data %>% select(-starts_with(target_col_final)))
+y_train <- train_data[[target_col_final]]
+
+xgb_model <- xgboost(
+ data = X_train,
+ label = y_train,
+ nrounds = 100,
+ objective = "reg:squarederror",
+ eta = 0.1,
+ max_depth = 4,
+ verbose = 0
+)
+
+importance_matrix <- xgb.importance(
+ feature_names = colnames(X_train),
+ model = xgb_model
+)
+
+top_n <- 15
+importance_data <- importance_matrix %>%
+    arrange(desc(Gain)) %>%
+    head(top_n) %>%
+    mutate(Feature_Clean = gsub("\\.", " ", Feature)) %>%
+    mutate(Wrapped_Feature = stringr::str_wrap(Feature_Clean, width = 35))
+
+ggplot(importance_data, aes(x = reorder(Wrapped_Feature, Gain), y = Gain)) +
+    geom_bar(stat = "identity", fill = "darkred") +
+    coord_flip() +
+    labs(
+        title = paste("                   Wykres Istotności Zmiennych - Top", top_n),
+        subtitle = paste("                   Wpływ na predykcję", target_variable, "mierzony wskaźnikiem Gain"),
+        x = "Zmienna",
+        y = "Gain"
+    ) +
+    theme_minimal() +
+    theme(
+        plot.title = element_text(hjust = 0),
+        plot.subtitle = element_text(hjust = 0),
+        plot.margin = margin(t = 20, r = 10, b = 5, l = 100), 
+        axis.text.y = element_text(size = 9, hjust = 1) 
+    )
+```
